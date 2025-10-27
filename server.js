@@ -1,17 +1,20 @@
 // Video Processing Backend for VideoEditorPro
-// Deploy this on Railway.app or Render.com (both free)
-
 const express = require('express');
 const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
+const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
-// Configure storage
+// Enable CORS
+app.use(cors());
+app.use(express.json());
+
+// Configure multer for file uploads
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         const uploadDir = './uploads';
@@ -21,262 +24,228 @@ const storage = multer.diskStorage({
         cb(null, uploadDir);
     },
     filename: (req, file, cb) => {
-        cb(null, `${uuidv4()}-${file.originalname}`);
+        const uniqueName = `${uuidv4()}${path.extname(file.originalname)}`;
+        cb(null, uniqueName);
     }
 });
 
 const upload = multer({ 
     storage: storage,
-    limits: { fileSize: 500 * 1024 * 1024 } // 500MB limit
+    limits: { fileSize: 100 * 1024 * 1024 } // 100MB limit
 });
 
-// Store processing jobs
-const jobs = new Map();
+// Create output directory
+const outputDir = './output';
+if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
+}
 
-// Middleware
-app.use(express.json());
-app.use('/output', express.static('output'));
-
-// Health check
+// Health check endpoint
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', service: 'VideoEditorPro Backend' });
+    res.json({ 
+        status: 'ok', 
+        service: 'VideoEditorPro Backend',
+        timestamp: new Date().toISOString()
+    });
 });
 
 // Upload endpoint
-app.post('/api/upload', upload.single('video'), (req, res) => {
+app.post('/upload', upload.single('video'), (req, res) => {
     try {
         if (!req.file) {
-            return res.status(400).json({ error: 'No file uploaded' });
+            return res.status(400).json({ error: 'No video file uploaded' });
         }
 
+        console.log(`Video uploaded: ${req.file.filename}`);
+        
         res.json({
             success: true,
-            fileId: path.basename(req.file.path),
-            filename: req.file.filename,
-            size: req.file.size
+            fileId: req.file.filename,
+            message: 'Video uploaded successfully'
         });
     } catch (error) {
         console.error('Upload error:', error);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: 'Upload failed', details: error.message });
     }
 });
 
-// Process videos endpoint
-app.post('/api/process', (req, res) => {
-    const { video1Id, video2Id, layout, settings } = req.body;
-    
-    if (!video1Id || !video2Id) {
-        return res.status(400).json({ error: 'Missing video IDs' });
-    }
+// Process endpoint - combines two videos
+app.post('/process', async (req, res) => {
+    try {
+        const { video1, video2, layout } = req.body;
 
-    const jobId = uuidv4();
-    const video1Path = path.join('./uploads', video1Id);
-    const video2Path = path.join('./uploads', video2Id);
-    const outputDir = './output';
-    const outputPath = path.join(outputDir, `${jobId}.mp4`);
-
-    // Create output directory
-    if (!fs.existsSync(outputDir)) {
-        fs.mkdirSync(outputDir, { recursive: true });
-    }
-
-    // Initialize job
-    jobs.set(jobId, {
-        status: 'processing',
-        progress: 0,
-        startTime: Date.now()
-    });
-
-    // Process videos based on layout
-    processVideos(video1Path, video2Path, outputPath, layout, settings, jobId)
-        .then(() => {
-            jobs.set(jobId, {
-                status: 'completed',
-                progress: 100,
-                outputUrl: `/output/${jobId}.mp4`,
-                completedTime: Date.now()
-            });
-        })
-        .catch((error) => {
-            console.error('Processing error:', error);
-            jobs.set(jobId, {
-                status: 'failed',
-                error: error.message,
-                failedTime: Date.now()
-            });
-        });
-
-    res.json({
-        success: true,
-        jobId: jobId,
-        message: 'Processing started'
-    });
-});
-
-// Check job status
-app.get('/api/jobs/:jobId', (req, res) => {
-    const { jobId } = req.params;
-    const job = jobs.get(jobId);
-
-    if (!job) {
-        return res.status(404).json({ error: 'Job not found' });
-    }
-
-    res.json(job);
-});
-
-// Download processed video
-app.get('/api/download/:jobId', (req, res) => {
-    const { jobId } = req.params;
-    const job = jobs.get(jobId);
-
-    if (!job || job.status !== 'completed') {
-        return res.status(404).json({ error: 'Video not ready' });
-    }
-
-    const filePath = path.join('./output', `${jobId}.mp4`);
-    
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ error: 'File not found' });
-    }
-
-    res.download(filePath);
-});
-
-// Process videos function
-async function processVideos(video1Path, video2Path, outputPath, layout, settings, jobId) {
-    return new Promise((resolve, reject) => {
-        let filterComplex = '';
-
-        // Apply settings to each video
-        const video1Settings = settings?.video1 || {};
-        const video2Settings = settings?.video2 || {};
-
-        switch (layout?.toLowerCase()) {
-            case 'side by side':
-                // Side by side layout
-                filterComplex = `
-                    [0:v]scale=960:1080,setsar=1[v1];
-                    [1:v]scale=960:1080,setsar=1[v2];
-                    [v1][v2]hstack=inputs=2[outv];
-                    [0:a][1:a]amix=inputs=2:duration=longest[outa]
-                `;
-                break;
-
-            case 'stacked':
-                // Stacked (vertical) layout
-                filterComplex = `
-                    [0:v]scale=1920:540,setsar=1[v1];
-                    [1:v]scale=1920:540,setsar=1[v2];
-                    [v1][v2]vstack=inputs=2[outv];
-                    [0:a][1:a]amix=inputs=2:duration=longest[outa]
-                `;
-                break;
-
-            default:
-                // Sequential (one after another)
-                filterComplex = `
-                    [0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]
-                `;
+        if (!video1 || !video2) {
+            return res.status(400).json({ error: 'Both video1 and video2 are required' });
         }
 
-        const command = ffmpeg();
-        
-        command
-            .input(video1Path)
-            .input(video2Path)
-            .complexFilter(filterComplex.trim())
-            .map('[outv]')
-            .map('[outa]')
-            .videoCodec('libx264')
-            .audioCodec('aac')
-            .audioBitrate('128k')
-            .videoBitrate('4000k')
-            .outputOptions([
-                '-preset fast',
-                '-crf 23',
-                '-movflags +faststart'
-            ])
-            .output(outputPath)
+        const video1Path = path.join('./uploads', video1);
+        const video2Path = path.join('./uploads', video2);
+
+        if (!fs.existsSync(video1Path) || !fs.existsSync(video2Path)) {
+            return res.status(404).json({ error: 'One or both videos not found' });
+        }
+
+        const outputId = `${uuidv4()}.mp4`;
+        const outputPath = path.join(outputDir, outputId);
+
+        console.log(`Processing: ${video1} + ${video2} with layout: ${layout}`);
+
+        // Create FFmpeg command based on layout
+        let ffmpegCommand;
+
+        if (layout === 'sidebyside') {
+            // Side by side layout
+            ffmpegCommand = ffmpeg()
+                .input(video1Path)
+                .input(video2Path)
+                .complexFilter([
+                    '[0:v]scale=iw/2:ih[left]',
+                    '[1:v]scale=iw/2:ih[right]',
+                    '[left][right]hstack=inputs=2[v]'
+                ])
+                .outputOptions([
+                    '-map [v]',
+                    '-map 0:a?',
+                    '-c:v libx264',
+                    '-preset fast',
+                    '-crf 23',
+                    '-c:a aac',
+                    '-b:a 128k',
+                    '-shortest'
+                ])
+                .output(outputPath);
+        } else if (layout === 'stacked') {
+            // Stacked (vertical) layout
+            ffmpegCommand = ffmpeg()
+                .input(video1Path)
+                .input(video2Path)
+                .complexFilter([
+                    '[0:v]scale=iw:ih/2[top]',
+                    '[1:v]scale=iw:ih/2[bottom]',
+                    '[top][bottom]vstack=inputs=2[v]'
+                ])
+                .outputOptions([
+                    '-map [v]',
+                    '-map 0:a?',
+                    '-c:v libx264',
+                    '-preset fast',
+                    '-crf 23',
+                    '-c:a aac',
+                    '-b:a 128k',
+                    '-shortest'
+                ])
+                .output(outputPath);
+        } else {
+            // Sequential (default)
+            ffmpegCommand = ffmpeg()
+                .input(video1Path)
+                .input(video2Path)
+                .complexFilter('[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]')
+                .outputOptions([
+                    '-map [v]',
+                    '-map [a]',
+                    '-c:v libx264',
+                    '-preset fast',
+                    '-crf 23',
+                    '-c:a aac',
+                    '-b:a 128k'
+                ])
+                .output(outputPath);
+        }
+
+        // Execute FFmpeg
+        ffmpegCommand
             .on('start', (commandLine) => {
-                console.log('FFmpeg command:', commandLine);
+                console.log('FFmpeg started:', commandLine);
             })
             .on('progress', (progress) => {
-                const percent = Math.round(progress.percent || 0);
-                const job = jobs.get(jobId);
-                if (job) {
-                    job.progress = percent;
-                }
-                console.log(`Processing: ${percent}% done`);
+                console.log(`Processing: ${progress.percent}% done`);
             })
             .on('end', () => {
-                console.log('Processing finished successfully');
-                
-                // Clean up input files after 1 hour
+                console.log(`Processing complete: ${outputId}`);
+                res.json({
+                    success: true,
+                    outputId: outputId,
+                    message: 'Videos processed successfully'
+                });
+
+                // Clean up input files after 5 minutes
                 setTimeout(() => {
                     try {
                         if (fs.existsSync(video1Path)) fs.unlinkSync(video1Path);
                         if (fs.existsSync(video2Path)) fs.unlinkSync(video2Path);
+                        console.log('Cleaned up input files');
                     } catch (err) {
                         console.error('Cleanup error:', err);
                     }
-                }, 3600000);
-                
-                resolve();
+                }, 5 * 60 * 1000);
             })
             .on('error', (err) => {
                 console.error('FFmpeg error:', err);
-                reject(err);
+                res.status(500).json({ 
+                    error: 'Processing failed', 
+                    details: err.message 
+                });
             })
             .run();
-    });
-}
 
-// Cleanup old files every hour
-setInterval(() => {
-    const now = Date.now();
-    const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+    } catch (error) {
+        console.error('Process error:', error);
+        res.status(500).json({ error: 'Processing failed', details: error.message });
+    }
+});
 
-    // Clean up old jobs
-    jobs.forEach((job, jobId) => {
-        const age = now - (job.completedTime || job.failedTime || job.startTime);
-        if (age > maxAge) {
-            jobs.delete(jobId);
-            
-            // Delete output file
-            const outputPath = path.join('./output', `${jobId}.mp4`);
-            if (fs.existsSync(outputPath)) {
-                fs.unlinkSync(outputPath);
-            }
+// Download endpoint
+app.get('/download/:fileId', (req, res) => {
+    try {
+        const fileId = req.params.fileId;
+        const filePath = path.join(outputDir, fileId);
+
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ error: 'File not found' });
         }
-    });
 
-    // Clean up old uploads
-    ['uploads', 'output'].forEach(dir => {
-        if (fs.existsSync(dir)) {
-            fs.readdirSync(dir).forEach(file => {
-                const filePath = path.join(dir, file);
-                const stats = fs.statSync(filePath);
-                const age = now - stats.mtimeMs;
-                
-                if (age > maxAge) {
-                    fs.unlinkSync(filePath);
-                    console.log(`Deleted old file: ${file}`);
+        console.log(`Downloading: ${fileId}`);
+
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="${fileId}"`);
+
+        const stream = fs.createReadStream(filePath);
+        stream.pipe(res);
+
+        stream.on('end', () => {
+            // Clean up output file after 5 minutes
+            setTimeout(() => {
+                try {
+                    if (fs.existsSync(filePath)) {
+                        fs.unlinkSync(filePath);
+                        console.log('Cleaned up output file');
+                    }
+                } catch (err) {
+                    console.error('Cleanup error:', err);
                 }
-            });
-        }
-    });
-}, 3600000); // Run every hour
+            }, 5 * 60 * 1000);
+        });
+
+    } catch (error) {
+        console.error('Download error:', error);
+        res.status(500).json({ error: 'Download failed', details: error.message });
+    }
+});
 
 // Start server
 app.listen(PORT, () => {
     console.log(`🚀 VideoEditorPro Backend running on port ${PORT}`);
-    console.log(`📍 Upload endpoint: http://localhost:${PORT}/api/upload`);
-    console.log(`📍 Process endpoint: http://localhost:${PORT}/api/process`);
+    console.log(`📍 Health check: http://localhost:${PORT}/health`);
 });
 
-// Handle shutdown gracefully
+// Handle graceful shutdown
 process.on('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down gracefully');
+    console.log('SIGTERM signal received: closing HTTP server');
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log('SIGINT signal received: closing HTTP server');
     process.exit(0);
 });
