@@ -72,7 +72,7 @@ app.post('/upload', upload.single('video'), (req, res) => {
 // Process endpoint - combines two videos
 app.post('/process', async (req, res) => {
     try {
-        const { video1, video2, layout } = req.body;
+        const { video1, video2, layout, audioOption = 'mixed' } = req.body;
 
         if (!video1 || !video2) {
             return res.status(400).json({ error: 'Both video1 and video2 are required' });
@@ -88,51 +88,52 @@ app.post('/process', async (req, res) => {
         const outputId = `${uuidv4()}.mp4`;
         const outputPath = path.join(outputDir, outputId);
 
-        console.log(`Processing: ${video1} + ${video2} with layout: ${layout}`);
+        console.log(`Processing: ${video1} + ${video2}`);
+        console.log(`Layout: ${layout}, Audio: ${audioOption}`);
 
-        // Create FFmpeg command based on layout
+        // Create FFmpeg command based on layout and audio option
         let ffmpegCommand;
 
         if (layout === 'sidebyside') {
-            // Side by side layout
+            // Side by side layout with both audio tracks mixed
             ffmpegCommand = ffmpeg()
                 .input(video1Path)
                 .input(video2Path)
                 .complexFilter([
                     '[0:v]scale=iw/2:ih[left]',
                     '[1:v]scale=iw/2:ih[right]',
-                    '[left][right]hstack=inputs=2[v]'
+                    '[left][right]hstack=inputs=2[v]',
+                    '[0:a][1:a]amix=inputs=2:duration=shortest[a]'
                 ])
                 .outputOptions([
                     '-map [v]',
-                    '-map 0:a?',
+                    '-map [a]',
                     '-c:v libx264',
                     '-preset fast',
                     '-crf 23',
                     '-c:a aac',
-                    '-b:a 128k',
-                    '-shortest'
+                    '-b:a 128k'
                 ])
                 .output(outputPath);
         } else if (layout === 'stacked') {
-            // Stacked (vertical) layout
+            // Stacked (vertical) layout with both audio tracks mixed
             ffmpegCommand = ffmpeg()
                 .input(video1Path)
                 .input(video2Path)
                 .complexFilter([
                     '[0:v]scale=iw:ih/2[top]',
                     '[1:v]scale=iw:ih/2[bottom]',
-                    '[top][bottom]vstack=inputs=2[v]'
+                    '[top][bottom]vstack=inputs=2[v]',
+                    '[0:a][1:a]amix=inputs=2:duration=shortest[a]'
                 ])
                 .outputOptions([
                     '-map [v]',
-                    '-map 0:a?',
+                    '-map [a]',
                     '-c:v libx264',
                     '-preset fast',
                     '-crf 23',
                     '-c:a aac',
-                    '-b:a 128k',
-                    '-shortest'
+                    '-b:a 128k'
                 ])
                 .output(outputPath);
         } else {
